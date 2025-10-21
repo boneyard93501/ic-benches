@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ic-benches"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "click>=8.1.0",
+  "pandas>=2.0.0",
+  "tomli>=2.0.0",
+  "pydantic>=2.0.0",
+  "python-dotenv>=1.0.0",
+  "structlog>=24.0.0",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = ["cli", "harness", "metrics"]  # these are src/cli.py, src/harness.py, src/metrics.py
+
+[project.scripts]
+ic-bench = "cli:main"
+
+[tool.uv]
+dev-dependencies = ["pytest>=8.0.0","pytest-cov>=4.0.0","pytest-timeout>=2.0.0","black>=24.0.0","ruff>=0.3.0","mypy>=1.8.0"]

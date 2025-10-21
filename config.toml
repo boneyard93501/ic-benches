@@ -1,0 +1,26 @@
+[dataset]
+seed = 42
+total_size_gb = 1  # 1GB total
+file_count = 10  # Just 10 files - enough for meaningful stats
+size_distribution = "fixed"  # Fixed size - consistent benchmarking
+min_file_size_mb = 100
+max_file_size_mb = 100  # All files 100MB - tests throughput, not tiny object overhead
+directory_depth = 1
+files_per_directory = 10
+data_path = "./data/s3-bench"
+
+[provider]
+name = "impossible_cloud"
+endpoint = "https://eu-east-1.storage.impossibleapi.net"
+region = "eu-east-1"
+bucket_prefix = "pl-01"
+storage_class = "STANDARD"
+
+[test]
+iterations = 3
+operations = ["PUT", "GET", "LIST", "HEAD", "DELETE"]
+cleanup_after_run = true
+warmup_operations = 2
+verify_checksums = true
+retry_attempts = 3
+timeout_seconds = 300

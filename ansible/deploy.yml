@@ -1,0 +1,84 @@
+- hosts: bench
+  become: yes
+  vars:
+    py: "python3"
+  tasks:
+    - name: Ensure base dirs
+      file: { path: "{{ repo_path }}", state: directory, mode: "0755" }
+
+    - name: Sync repo to VM (rsync)
+      synchronize:
+        src: "{{ playbook_dir }}/.."
+        dest: "{{ repo_path }}"
+        delete: no
+      delegate_to: localhost
+
+    - name: Install uv (optional)
+      when: install_uv
+      shell: "{{ py }} -m pip install --upgrade uv"
+      args: { warn: false }
+
+    - name: Install mc (optional, Linux x64)
+      when: install_mc
+      block:
+        - shell: |
+            curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
+            chmod +x /usr/local/bin/mc
+          args: { warn: false }
+        - shell: "mc --version"
+
+    - name: Write .env if provided
+      when: env_file_src is file
+      copy:
+        src: "{{ env_file_src }}"
+        dest: "{{ repo_path }}/.env"
+        mode: "0600"
+      delegate_to: localhost
+
+    - name: Write config.toml if provided
+      when: config_file_src is file
+      copy:
+        src: "{{ config_file_src }}"
+        dest: "{{ repo_path }}/config.toml"
+        mode: "0644"
+      delegate_to: localhost
+
+    - name: Install project deps
+      shell: |
+        cd {{ repo_path }}
+        uv sync && uv pip install -e .
+      args: { chdir: "{{ repo_path }}" }
+
+    - name: Generate dataset (idempotent)
+      shell: |
+        uv run {{ py }} scripts/data_gen.py --config config.toml
+      args: { chdir: "{{ repo_path }}" }
+
+    - name: Run tests (integration, no mocks)
+      shell: |
+        uv run pytest -v tests/integration
+      args: { chdir: "{{ repo_path }}" }
+
+    - name: Run benchmark (full or quick)
+      shell: |
+        uv run ic-bench --config config.toml --env .env {{ '--quick' if run_quick else '' }}
+      args: { chdir: "{{ repo_path }}" }
+
+    - name: Archive metrics on VM
+      vars:
+        ts: "{{ '%Y%m%dT%H%M%SZ' | strftime(ansible_date_time.epoch) }}"
+        archive_dir: "{{ repo_path }}/.bench_archives"
+        archive_name: "metrics_{{ ts }}.tar.gz"
+      block:
+        - file: { path: "{{ archive_dir }}", state: directory, mode: "0755" }
+        - shell: |
+            set -e
+            tar -czf {{ archive_dir }}/{{ archive_name }} \
+              -C {{ data_path }} . || true
+            # include quick path if present
+            if [ -d "{{ quick_data_path }}" ]; then \
+              tar -rzf {{ archive_dir }}/{{ archive_name }} -C {{ quick_data_path }} .; \
+            fi
+          args: { chdir: "{{ repo_path }}" }
+        - set_fact:
+            vm_metrics_archive: "{{ archive_dir }}/{{ archive_name }}"

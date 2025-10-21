@@ -1,0 +1,58 @@
+- hosts: bench
+  gather_facts: no
+  vars:
+    # expects vm_metrics_archive from deploy or recompute here:
+    archive_glob: "{{ repo_path }}/.bench_archives/metrics_*.tar.gz"
+  tasks:
+    - name: Find latest archive on VM
+      shell: "ls -1t {{ archive_glob }} | head -n1"
+      register: found_archive
+      changed_when: false
+
+    - name: Fail if no archive found
+      fail:
+        msg: "No metrics archive found at {{ archive_glob }}"
+      when: found_archive.stdout | trim == ""
+
+    - name: Set archive path fact
+      set_fact:
+        metrics_archive: "{{ found_archive.stdout | trim }}"
+
+    - name: Create local dest (when local)
+      when: collect_mode == 'local'
+      delegate_to: localhost
+      file: { path: "{{ local_dest }}", state: directory, mode: "0755" }
+
+    - name: Fetch archive to controller (local collection)
+      when: collect_mode == 'local'
+      fetch:
+        src: "{{ metrics_archive }}"
+        dest: "{{ local_dest }}/"
+        flat: yes
+
+    - name: Upload archive to S3 (remote collection)
+      when: collect_mode == 's3'
+      vars:
+        obj_key: "{{ s3_prefix | trim('/') }}/{{ metrics_archive | basename }}"
+      block:
+        - name: Ensure amazon.aws collection present (controller)
+          delegate_to: localhost
+          ansible.builtin.command: ansible-galaxy collection install amazon.aws
+          changed_when: false
+
+        - name: Push to S3
+          amazon.aws.aws_s3:
+            bucket: "{{ s3_bucket }}"
+            object: "{{ obj_key }}"
+            src: "{{ metrics_archive }}"
+            mode: put
+            region: "{{ s3_region }}"
+            aws_access_key: "{{ aws_access_key_id | default(omit) }}"
+            aws_secret_key: "{{ aws_secret_access_key | default(omit) }}"
+            security_token: "{{ aws_session_token | default(omit) }}"
+
+    - name: Print result location
+      debug:
+        msg: >-
+          Metrics archived:
+          {{ (collect_mode == 'local') | ternary((local_dest ~ '/' ~ (metrics_archive | basename)), ('s3://' ~ s3_bucket ~ '/' ~ s3_prefix | trim('/') ~ '/' ~ (metrics_archive | basename))) }}
