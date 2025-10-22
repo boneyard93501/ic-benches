@@ -1,0 +1,18 @@
+- hosts: all
+  gather_facts: no
+  tasks:
+    - name: Ping host via SSH
+      ansible.builtin.ping:
+
+    - name: Show Python version
+      ansible.builtin.shell: python3 --version
+      register: pyver
+      changed_when: false
+
+    - name: Display connection info
+      debug:
+        msg: |
+          ✅ Connected to {{ inventory_hostname }}
+          Host: {{ ansible_host }}
+          User: {{ ansible_user | default('unknown') }}
+          Python: {{ pyver.stdout }}
