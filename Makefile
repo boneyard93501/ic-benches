@@ -80,3 +80,21 @@ clean:
 
 purge: clean
 	rm -rf $(DATA_DIR)* reports/metrics metrics
+
+# ----------------------------------------------------------------------------
+# Post-processing / Visualization
+# ----------------------------------------------------------------------------
+.PHONY: unpack visualize-all
+
+# Unpack the latest metrics tarball to ./metrics/extracted
+unpack:
+	mkdir -p metrics/extracted
+	latest=$$(ls -1t metrics/metrics_*.tar.gz | head -n1); \
+	echo "Unpacking $$latest ..."; \
+	tar -xzf $$latest -C metrics/extracted
+
+# Unpack + visualize in one step
+visualize-all: unpack
+	$(PYTHON) scripts/visualize_metrics.py \
+		--input metrics/extracted/data/s3-bench/consolidated_metrics.csv \
+		--outdir reports/metrics
