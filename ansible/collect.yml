@@ -1,58 +1,93 @@
-- hosts: bench
+- name: Collect ic-benches metrics archive from VM
+  hosts: bench
   gather_facts: no
   vars:
-    # expects vm_metrics_archive from deploy or recompute here:
+    # -------- Defaults (override with -e as needed) --------
+    repo_path: /opt/ic-benches
     archive_glob: "{{ repo_path }}/.bench_archives/metrics_*.tar.gz"
+
+    collect_mode: local            # local | s3
+    local_dest: ./metrics          # used when collect_mode=local
+
+    s3_bucket: ""                  # used when collect_mode=s3
+    s3_prefix: "ic-benches/results"
+    s3_region: "us-east-1"
+    # AWS creds are read from env if not passed:
+    aws_access_key_id: "{{ lookup('env','AWS_ACCESS_KEY_ID') | default('', true) }}"
+    aws_secret_access_key: "{{ lookup('env','AWS_SECRET_ACCESS_KEY') | default('', true) }}"
+    aws_session_token: "{{ lookup('env','AWS_SESSION_TOKEN') | default('', true) }}"
+
   tasks:
     - name: Find latest archive on VM
-      shell: "ls -1t {{ archive_glob }} | head -n1"
+      ansible.builtin.shell: "ls -1t {{ archive_glob }} 2>/dev/null | head -n1"
       register: found_archive
       changed_when: false
+      failed_when: found_archive.stdout | trim == ""
 
-    - name: Fail if no archive found
-      fail:
-        msg: "No metrics archive found at {{ archive_glob }}"
-      when: found_archive.stdout | trim == ""
-
-    - name: Set archive path fact
-      set_fact:
+    - name: Set archive fact
+      ansible.builtin.set_fact:
         metrics_archive: "{{ found_archive.stdout | trim }}"
 
-    - name: Create local dest (when local)
-      when: collect_mode == 'local'
+    # -------------------- LOCAL COLLECTION --------------------
+    - name: Ensure local destination exists
+      when: collect_mode == "local"
       delegate_to: localhost
-      file: { path: "{{ local_dest }}", state: directory, mode: "0755" }
+      ansible.builtin.file:
+        path: "{{ local_dest }}"
+        state: directory
+        mode: "0755"
 
-    - name: Fetch archive to controller (local collection)
-      when: collect_mode == 'local'
-      fetch:
+    - name: Fetch archive to controller (local)
+      when: collect_mode == "local"
+      ansible.builtin.fetch:
         src: "{{ metrics_archive }}"
         dest: "{{ local_dest }}/"
         flat: yes
 
-    - name: Upload archive to S3 (remote collection)
-      when: collect_mode == 's3'
-      vars:
-        obj_key: "{{ s3_prefix | trim('/') }}/{{ metrics_archive | basename }}"
-      block:
-        - name: Ensure amazon.aws collection present (controller)
-          delegate_to: localhost
-          ansible.builtin.command: ansible-galaxy collection install amazon.aws
-          changed_when: false
+    # -------------------- S3 COLLECTION --------------------
+    - name: Create temp dir on controller for S3 upload
+      when: collect_mode == "s3"
+      delegate_to: localhost
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: _ic_benches
+      register: tmp_dir
 
-        - name: Push to S3
-          amazon.aws.aws_s3:
-            bucket: "{{ s3_bucket }}"
-            object: "{{ obj_key }}"
-            src: "{{ metrics_archive }}"
-            mode: put
-            region: "{{ s3_region }}"
-            aws_access_key: "{{ aws_access_key_id | default(omit) }}"
-            aws_secret_key: "{{ aws_secret_access_key | default(omit) }}"
-            security_token: "{{ aws_session_token | default(omit) }}"
+    - name: Fetch archive to controller temp (S3 mode)
+      when: collect_mode == "s3"
+      ansible.builtin.fetch:
+        src: "{{ metrics_archive }}"
+        dest: "{{ tmp_dir.path }}/"
+        flat: yes
 
-    - name: Print result location
-      debug:
+    - name: Ensure amazon.aws collection present (controller)
+      when: collect_mode == "s3"
+      delegate_to: localhost
+      ansible.builtin.command: ansible-galaxy collection install amazon.aws
+      changed_when: false
+
+    - name: Upload archive to S3
+      when: collect_mode == "s3"
+      delegate_to: localhost
+      amazon.aws.aws_s3:
+        mode: put
+        region: "{{ s3_region }}"
+        bucket: "{{ s3_bucket }}"
+        object: >-
+          {{ (s3_prefix | trim('/')) ~ '/' ~ (metrics_archive | basename) }}
+        src: "{{ tmp_dir.path }}/{{ metrics_archive | basename }}"
+        aws_access_key: "{{ aws_access_key_id | default(omit) }}"
+        aws_secret_key: "{{ aws_secret_access_key | default(omit) }}"
+        security_token: "{{ aws_session_token | default(omit) }}"
+
+    # -------------------- OUTPUT --------------------
+    - name: Result (local)
+      when: collect_mode == "local"
+      ansible.builtin.debug:
+        msg: "Fetched: {{ local_dest }}/{{ metrics_archive | basename }}"
+
+    - name: Result (s3)
+      when: collect_mode == "s3"
+      ansible.builtin.debug:
         msg: >-
-          Metrics archived:
-          {{ (collect_mode == 'local') | ternary((local_dest ~ '/' ~ (metrics_archive | basename)), ('s3://' ~ s3_bucket ~ '/' ~ s3_prefix | trim('/') ~ '/' ~ (metrics_archive | basename))) }}
+          Uploaded: s3://{{ s3_bucket }}/{{ (s3_prefix | trim('/')) }}/{{ metrics_archive | basename }}

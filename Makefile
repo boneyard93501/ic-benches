@@ -1,5 +1,5 @@
 # ============================================================================
-# ic-benches Makefile (with help)
+# ic-benches Makefile
 # ============================================================================
 SHELL := /bin/bash
 PYTHON := uv run python
@@ -18,9 +18,12 @@ help: ## Show this help
 
 # --------------------------- ENV / INSTALL -----------------------------------
 .PHONY: setup install
-setup install: ## Install deps (uv) and project in editable mode
+setup: ## Install deps (uv) and project in editable mode
 	uv sync
 	uv pip install -e .
+
+install: ## Alias for setup
+	$(MAKE) setup
 
 # ------------------------------ TESTS ----------------------------------------
 .PHONY: test coverage
@@ -53,7 +56,7 @@ visualize: ## Generate PNG plots to $(REPORTS_DIR)
 
 unpack: ## Unpack latest metrics tarball from ./metrics to ./metrics/extracted
 	mkdir -p metrics/extracted
-	latest=$$(ls -1t metrics/metrics_*.tar.gz | head -n1); \
+	latest=$$(ls -1t metrics/metrics_*.tar.gz 2>/dev/null | head -n1); \
 	[ -n "$$latest" ] || { echo "No metrics tarball in ./metrics/"; exit 1; }; \
 	echo "Unpacking $$latest ..."; \
 	tar -xzf "$$latest" -C metrics/extracted
@@ -64,9 +67,12 @@ visualize-all: unpack ## Unpack latest tarball and then generate PNG plots
 		--outdir $(REPORTS_DIR)
 
 # ------------------------------ ANSIBLE --------------------------------------
-.PHONY: deploy collect collect-local collect-s3 test-connection
-deploy: ## Copy repo to VM, install deps, run tests + benchmark
+.PHONY: deploy deploy-quick collect collect-local collect-s3 test-connection
+deploy: ## Copy repo, install deps, run tests + full benchmark on VM
 	$(ANSIBLE) ansible/deploy.yml
+
+deploy-quick: ## Copy repo, install deps, run tests + QUICK benchmark on VM
+	$(ANSIBLE) ansible/deploy.yml -e run_quick=true
 
 collect: ## Collect metrics using defaults in collect.yml vars
 	$(ANSIBLE) ansible/collect.yml
@@ -93,13 +99,3 @@ clean: ## Remove caches/build artifacts
 
 purge: clean ## Also remove datasets and reports
 	rm -rf $(DATA_DIR)* reports/metrics metrics
-
-# --------------------------- ENV / INSTALL -----------------------------------
-.PHONY: setup install
-setup: ## Install deps (uv) and project in editable mode
-	uv sync
-	uv pip install -e .
-
-install: ## Alias for setup
-	$(MAKE) setup
-

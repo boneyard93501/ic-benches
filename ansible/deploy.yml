@@ -1,84 +1,198 @@
-- hosts: bench
-  become: yes
+- name: Deploy ic-benches, run tests and benchmark, archive metrics
+  hosts: bench
+  gather_facts: yes
   vars:
-    py: "python3"
-  tasks:
-    - name: Ensure base dirs
-      file: { path: "{{ repo_path }}", state: directory, mode: "0755" }
+    # -------- Paths / toggles --------
+    repo_path: /opt/ic-benches
+    data_path: "{{ repo_path }}/data/s3-bench"
+    quick_data_path: "{{ repo_path }}/data/s3-bench-quick"
+    run_quick: false                        # set true to run --quick
+    env_file_src: "{{ playbook_dir }}/../.env"           # on controller
+    config_file_src: "{{ playbook_dir }}/../config.toml" # on controller
+    ansible_python_interpreter: /usr/bin/python3
 
-    - name: Sync repo to VM (rsync)
-      synchronize:
-        src: "{{ playbook_dir }}/.."
+  tasks:
+    # ---------- resolve controller project root (ABS path, no '..') ----------
+    - name: Resolve absolute project root on controller
+      delegate_to: localhost
+      ansible.builtin.command: bash -lc 'cd "{{ playbook_dir }}/.." && pwd -P'
+      register: project_root
+      changed_when: false
+
+    # ---------- create /opt/ic-benches with sudo, then hand to SSH user ----------
+    - name: Ensure base dir with sudo
+      become: yes
+      ansible.builtin.file:
+        path: "{{ repo_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: Chown repo dir to SSH user
+      become: yes
+      ansible.builtin.file:
+        path: "{{ repo_path }}"
+        state: directory
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        recurse: yes
+
+    # ---------- rsync project (controller -> remote), no chdir, no '..' ----------
+    - name: Rsync repo to VM from absolute project root
+      delegate_to: localhost
+      ansible.posix.synchronize:
+        src: "{{ project_root.stdout }}/"
         dest: "{{ repo_path }}"
         delete: no
+        recursive: yes
+        archive: yes
+        compress: yes
+        rsync_opts:
+          - "--exclude=.git"
+          - "--exclude=.venv"
+          - "--exclude=htmlcov"
+          - "--exclude=metrics"
+          - "--exclude=reports"
+
+    # ---------- prerequisites on remote (no assumptions) ----------
+    - name: Ensure base packages present (curl, tar, rsync)
+      become: yes
+      ansible.builtin.package:
+        name:
+          - curl
+          - tar
+          - rsync
+        state: present
+
+    # ---------- install uv standalone (no pip dependency) ----------
+    - name: Install uv to ~/.local/bin (idempotent)
+      ansible.builtin.shell: |
+        set -e
+        curl -LsSf https://astral.sh/uv/install.sh | sh
+      args:
+        creates: "{{ ansible_user_dir }}/.local/bin/uv"
+
+    - name: Detect uv binary
+      ansible.builtin.shell: "command -v uv || echo {{ ansible_user_dir }}/.local/bin/uv"
+      register: uv_path
+      changed_when: false
+
+    - name: Set uv_bin fact
+      ansible.builtin.set_fact:
+        uv_bin: "{{ uv_path.stdout }}"
+
+    # ---------- install MinIO 'mc' (S3 client) ----------
+    - name: Select mc binary URL for platform
+      ansible.builtin.set_fact:
+        mc_url: >-
+          https://dl.min.io/client/mc/release/{{
+            'linux-amd64' if ansible_architecture in ['x86_64','amd64'] else
+            'linux-arm64' if ansible_architecture in ['aarch64','arm64'] else
+            'linux-amd64'
+          }}/mc
+
+    - name: Ensure /usr/local/bin exists
+      become: yes
+      ansible.builtin.file:
+        path: /usr/local/bin
+        state: directory
+        mode: "0755"
+
+    - name: Install mc binary
+      become: yes
+      ansible.builtin.get_url:
+        url: "{{ mc_url }}"
+        dest: /usr/local/bin/mc
+        mode: "0755"
+
+    - name: Verify mc is available
+      ansible.builtin.command: mc --version
+      register: mc_ver
+      changed_when: false
+
+    # ---------- copy configs (controller → remote) ----------
+    - name: Check .env exists on controller
       delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ env_file_src }}"
+      register: env_local
+      changed_when: false
 
-    - name: Install uv (optional)
-      when: install_uv
-      shell: "{{ py }} -m pip install --upgrade uv"
-      args: { warn: false }
+    - name: Check config.toml exists on controller
+      delegate_to: localhost
+      ansible.builtin.stat:
+        path: "{{ config_file_src }}"
+      register: cfg_local
+      changed_when: false
 
-    - name: Install mc (optional, Linux x64)
-      when: install_mc
-      block:
-        - shell: |
-            curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
-            chmod +x /usr/local/bin/mc
-          args: { warn: false }
-        - shell: "mc --version"
-
-    - name: Write .env if provided
-      when: env_file_src is file
-      copy:
+    - name: Copy .env if present (controller -> remote)
+      when: env_local.stat.exists
+      ansible.builtin.copy:
         src: "{{ env_file_src }}"
         dest: "{{ repo_path }}/.env"
         mode: "0600"
-      delegate_to: localhost
 
-    - name: Write config.toml if provided
-      when: config_file_src is file
-      copy:
+    - name: Copy config.toml if present (controller -> remote)
+      when: cfg_local.stat.exists
+      ansible.builtin.copy:
         src: "{{ config_file_src }}"
         dest: "{{ repo_path }}/config.toml"
         mode: "0644"
-      delegate_to: localhost
 
-    - name: Install project deps
-      shell: |
-        cd {{ repo_path }}
-        uv sync && uv pip install -e .
-      args: { chdir: "{{ repo_path }}" }
+    # ---------- project install / run with uv ----------
+    - name: Install project deps (uv sync + editable install)
+      ansible.builtin.shell: |
+        "{{ uv_bin }}" sync
+        "{{ uv_bin }}" pip install -e .
+      args:
+        chdir: "{{ repo_path }}"
 
     - name: Generate dataset (idempotent)
-      shell: |
-        uv run {{ py }} scripts/data_gen.py --config config.toml
-      args: { chdir: "{{ repo_path }}" }
+      ansible.builtin.shell: >
+        "{{ uv_bin }}" run python scripts/data_gen.py --config config.toml
+      args:
+        chdir: "{{ repo_path }}"
 
-    - name: Run tests (integration, no mocks)
-      shell: |
-        uv run pytest -v tests/integration
-      args: { chdir: "{{ repo_path }}" }
+    - name: Run tests (integration)
+      ansible.builtin.shell: >
+        "{{ uv_bin }}" run pytest -v tests/integration
+      args:
+        chdir: "{{ repo_path }}"
 
     - name: Run benchmark (full or quick)
-      shell: |
-        uv run ic-bench --config config.toml --env .env {{ '--quick' if run_quick else '' }}
-      args: { chdir: "{{ repo_path }}" }
+      ansible.builtin.shell: >
+        "{{ uv_bin }}" run ic-bench --config config.toml --env .env
+        {{ '--quick' if run_quick else '' }}
+      args:
+        chdir: "{{ repo_path }}"
 
+    # ---------- archive metrics on remote (single tar, conditional includes) ----------
     - name: Archive metrics on VM
       vars:
         ts: "{{ '%Y%m%dT%H%M%SZ' | strftime(ansible_date_time.epoch) }}"
         archive_dir: "{{ repo_path }}/.bench_archives"
         archive_name: "metrics_{{ ts }}.tar.gz"
       block:
-        - file: { path: "{{ archive_dir }}", state: directory, mode: "0755" }
-        - shell: |
+        - ansible.builtin.file:
+            path: "{{ archive_dir }}"
+            state: directory
+            mode: "0755"
+
+        - ansible.builtin.shell: |
             set -e
-            tar -czf {{ archive_dir }}/{{ archive_name }} \
-              -C {{ data_path }} . || true
-            # include quick path if present
-            if [ -d "{{ quick_data_path }}" ]; then \
-              tar -rzf {{ archive_dir }}/{{ archive_name }} -C {{ quick_data_path }} .; \
+            INCLUDE=""
+            if [ -d "{{ data_path }}" ]; then
+              INCLUDE="$INCLUDE -C {{ repo_path }} data/s3-bench"
             fi
-          args: { chdir: "{{ repo_path }}" }
-        - set_fact:
+            if [ -d "{{ quick_data_path }}" ]; then
+              INCLUDE="$INCLUDE -C {{ repo_path }} data/s3-bench-quick"
+            fi
+            if [ -n "$INCLUDE" ]; then
+              tar -czf {{ archive_dir }}/{{ archive_name }} $INCLUDE
+            else
+              echo "No data directories to archive; skipping."
+            fi
+          args:
+            chdir: "{{ repo_path }}"
+
+        - ansible.builtin.set_fact:
             vm_metrics_archive: "{{ archive_dir }}/{{ archive_name }}"
