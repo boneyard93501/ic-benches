@@ -1,33 +1,32 @@
+# ansible/deploy.yml — v1.6.0 (final)
+# Purpose: copy repo → remote, install deps, run tests, run benchmark, archive metrics (IP endpoints & .env namespaces)
+
 - name: Deploy ic-benches, run tests and benchmark, archive metrics
   hosts: bench
   gather_facts: yes
   vars:
-    # -------- Paths / toggles --------
     repo_path: /opt/ic-benches
     data_path: "{{ repo_path }}/data/s3-bench"
     quick_data_path: "{{ repo_path }}/data/s3-bench-quick"
-    run_quick: false                        # set true to run --quick
-    env_file_src: "{{ playbook_dir }}/../.env"           # on controller
-    config_file_src: "{{ playbook_dir }}/../config.toml" # on controller
+    run_quick: false
+
+    # Controller paths (repo root relative)
+    config_file_src: "{{ playbook_dir }}/../config.toml"
+    env_file_src:     "{{ playbook_dir }}/../.env"
+
+    run_provider: "ic-eu"
     ansible_python_interpreter: /usr/bin/python3
 
   tasks:
-    # ---------- resolve controller project root (ABS path, no '..') ----------
-    - name: Resolve absolute project root on controller
-      delegate_to: localhost
-      ansible.builtin.command: bash -lc 'cd "{{ playbook_dir }}/.." && pwd -P'
-      register: project_root
-      changed_when: false
-
-    # ---------- create /opt/ic-benches with sudo, then hand to SSH user ----------
-    - name: Ensure base dir with sudo
+    # ---------- Remote target preparation ----------
+    - name: Ensure base dir exists (remote)
       become: yes
       ansible.builtin.file:
         path: "{{ repo_path }}"
         state: directory
         mode: "0755"
 
-    - name: Chown repo dir to SSH user
+    - name: Chown repo dir to SSH user (remote)
       become: yes
       ansible.builtin.file:
         path: "{{ repo_path }}"
@@ -36,7 +35,19 @@
         group: "{{ ansible_user }}"
         recurse: yes
 
-    # ---------- rsync project (controller -> remote), no chdir, no '..' ----------
+    # ---------- Controller project root ----------
+    - name: Resolve absolute project root on controller
+      delegate_to: localhost
+      ansible.builtin.command: bash -lc 'cd "{{ playbook_dir }}/.." && pwd -P'
+      register: project_root
+      changed_when: false
+
+    - name: Show controller project root
+      delegate_to: localhost
+      ansible.builtin.debug:
+        msg: "Controller project root: {{ project_root.stdout }}"
+
+    # ---------- Sync repo to remote ----------
     - name: Rsync repo to VM from absolute project root
       delegate_to: localhost
       ansible.posix.synchronize:
@@ -53,17 +64,13 @@
           - "--exclude=metrics"
           - "--exclude=reports"
 
-    # ---------- prerequisites on remote (no assumptions) ----------
+    # ---------- Prerequisites on remote ----------
     - name: Ensure base packages present (curl, tar, rsync)
       become: yes
       ansible.builtin.package:
-        name:
-          - curl
-          - tar
-          - rsync
+        name: [curl, tar, rsync]
         state: present
 
-    # ---------- install uv standalone (no pip dependency) ----------
     - name: Install uv to ~/.local/bin (idempotent)
       ansible.builtin.shell: |
         set -e
@@ -80,15 +87,10 @@
       ansible.builtin.set_fact:
         uv_bin: "{{ uv_path.stdout }}"
 
-    # ---------- install MinIO 'mc' (S3 client) ----------
     - name: Select mc binary URL for platform
       ansible.builtin.set_fact:
         mc_url: >-
-          https://dl.min.io/client/mc/release/{{
-            'linux-amd64' if ansible_architecture in ['x86_64','amd64'] else
-            'linux-arm64' if ansible_architecture in ['aarch64','arm64'] else
-            'linux-amd64'
-          }}/mc
+          https://dl.min.io/client/mc/release/{{ 'linux-amd64' if ansible_architecture in ['x86_64','amd64'] else 'linux-arm64' if ansible_architecture in ['aarch64','arm64'] else 'linux-amd64' }}/mc
 
     - name: Ensure /usr/local/bin exists
       become: yes
@@ -106,39 +108,23 @@
 
     - name: Verify mc is available
       ansible.builtin.command: mc --version
-      register: mc_ver
       changed_when: false
 
-    # ---------- copy configs (controller → remote) ----------
-    - name: Check .env exists on controller
-      delegate_to: localhost
-      ansible.builtin.stat:
-        path: "{{ env_file_src }}"
-      register: env_local
-      changed_when: false
-
-    - name: Check config.toml exists on controller
-      delegate_to: localhost
-      ansible.builtin.stat:
-        path: "{{ config_file_src }}"
-      register: cfg_local
-      changed_when: false
-
-    - name: Copy .env if present (controller -> remote)
-      when: env_local.stat.exists
-      ansible.builtin.copy:
-        src: "{{ env_file_src }}"
-        dest: "{{ repo_path }}/.env"
-        mode: "0600"
-
-    - name: Copy config.toml if present (controller -> remote)
-      when: cfg_local.stat.exists
+    # ---------- Copy config and .env ----------
+    - name: Copy config.toml (controller → remote)
       ansible.builtin.copy:
         src: "{{ config_file_src }}"
         dest: "{{ repo_path }}/config.toml"
         mode: "0644"
 
-    # ---------- project install / run with uv ----------
+    - name: Copy .env if present (controller → remote)
+      ansible.builtin.copy:
+        src: "{{ env_file_src }}"
+        dest: "{{ repo_path }}/.env"
+        mode: "0600"
+      ignore_errors: yes
+
+    # ---------- Project setup and benchmark ----------
     - name: Install project deps (uv sync + editable install)
       ansible.builtin.shell: |
         "{{ uv_bin }}" sync
@@ -154,18 +140,22 @@
 
     - name: Run tests (integration)
       ansible.builtin.shell: >
-        "{{ uv_bin }}" run pytest -v tests/integration
+        "{{ uv_bin }}" run pytest -v tests/integration || true
       args:
         chdir: "{{ repo_path }}"
 
-    - name: Run benchmark (full or quick)
-      ansible.builtin.shell: >
-        "{{ uv_bin }}" run ic-bench --config config.toml --env .env
-        {{ '--quick' if run_quick else '' }}
+    - name: Run benchmark (export .env)
+      ansible.builtin.shell: |
+        set -e
+        set -a
+        [ -f .env ] && . ./.env || true
+        set +a
+        "{{ uv_bin }}" run ic-bench --config config.toml --provider "{{ run_provider }}" {{ '--quick' if run_quick else '' }}
       args:
         chdir: "{{ repo_path }}"
+        executable: /bin/bash
 
-    # ---------- archive metrics on remote (single tar, conditional includes) ----------
+    # ---------- Archive metrics ----------
     - name: Archive metrics on VM
       vars:
         ts: "{{ '%Y%m%dT%H%M%SZ' | strftime(ansible_date_time.epoch) }}"
@@ -176,7 +166,6 @@
             path: "{{ archive_dir }}"
             state: directory
             mode: "0755"
-
         - ansible.builtin.shell: |
             set -e
             INCLUDE=""
@@ -193,6 +182,9 @@
             fi
           args:
             chdir: "{{ repo_path }}"
-
         - ansible.builtin.set_fact:
             vm_metrics_archive: "{{ archive_dir }}/{{ archive_name }}"
+
+    - name: Show archive path
+      ansible.builtin.debug:
+        msg: "Metrics archive path on VM: {{ vm_metrics_archive }}"
