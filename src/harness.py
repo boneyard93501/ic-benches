@@ -1,14 +1,7 @@
 #!/usr/bin/env python3
-"""
-Production-grade S3 benchmarking harness using MinIO CLI (mc).
-
-Design:
-- Deterministic dataset under dataset.data_path
-- Stable bucket name = provider.bucket_prefix (created if missing, else reused)
-- Run-scoped object prefix = run_id/ (no bucket churn)
-- Provider-agnostic key mapping from local files → object keys via KeyBuilder
-- HEAD targets derived from local dataset (not mc ls), eliminating ambiguity
-- NDJSON metrics at <dataset.data_path>/<provider>.ndjson (manifest SHA-256 linked)
+"""S3 Bench Harness — v1.6.0 (.env namespaces, final)
+- Provider-namespace credentials via environment (Ansible exports .env)
+- Honors [test] loop and writes NDJSON
 """
 from __future__ import annotations
 
@@ -16,275 +9,162 @@ import json
 import subprocess
 import tempfile
 import time
-import hashlib
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional
 
 import tomli
-from dotenv import dotenv_values
-import structlog
 
-logger = structlog.get_logger()
+from credentials import CredentialResolver
 
 
 @dataclass(frozen=True)
-class KeyBuilder:
-    """Maps local dataset files to provider object keys under a run-scoped prefix."""
-    run_prefix: str            # e.g., 20251020T142233Z
-    base_path: Path            # dataset root (absolute)
-
-    def object_key(self, local_file: Path) -> str:
-        """Return object key relative to bucket (run_prefix/relative_path)."""
-        rel = local_file.relative_to(self.base_path).as_posix()
-        return f"{self.run_prefix}/{rel}"
+class Provider:
+    id: str
+    namespace: str
+    endpoint: str
+    region: str
+    bucket: str
+    insecure_ssl: bool = False
+    profile: Optional[str] = None
 
 
 class S3Harness:
-    def __init__(
-        self,
-        config_file: str = "config.toml",
-        env_file: str = ".env",
-        provider_override: Optional[str] = None,
-    ) -> None:
-        # ---- config ----
-        with open(config_file, "rb") as f:
+    def __init__(self, *, config_file: str = "config.toml", provider_override: Optional[str] = None, profile: Optional[str] = None):
+        self.config_path = Path(config_file)
+        with open(self.config_path, "rb") as f:
             cfg = tomli.load(f)
         self.cfg = cfg
         self.dataset = cfg["dataset"]
-        self.provider = cfg["provider"].copy()
-        self.test = cfg["test"].copy()
-        if provider_override:
-            self.provider["name"] = provider_override
-
-        # ---- credentials ----
-        env = dotenv_values(env_file)
-        prefix = {
-            "impossible_cloud": "IC_",
-            "aws": "AWS_",
-            "akave": "AKAVE_",
-        }.get(self.provider["name"], "S3_")
-        self.access_key = env.get(f"{prefix}ACCESS_KEY")
-        self.secret_key = env.get(f"{prefix}SECRET_KEY")
-        self.session_token = env.get(f"{prefix}SESSION_TOKEN")
-        if not self.access_key or not self.secret_key:
-            raise RuntimeError(
-                f"Missing credentials for provider {self.provider['name']} with prefix {prefix} in {env_file}"
-            )
-
-        # ---- dataset root ----
+        self.test = cfg.get("test", {})
         self.data_path = Path(self.dataset["data_path"]).resolve()
-        self.manifest_path = self.data_path / "manifest.json"
-        if not self.manifest_path.exists():
-            raise FileNotFoundError(f"manifest.json not found at {self.manifest_path}")
-        self.manifest_sha256 = self._sha256_file(self.manifest_path)
+        self.data_path.mkdir(parents=True, exist_ok=True)
 
-        # ---- metrics output ----
-        self.provider_name = self.provider["name"]
-        self.ndjson_path = self.data_path / f"{self.provider_name}.ndjson"
-
-        # ---- runtime naming ----
-        self.run_id = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        self.bucket = self.provider.get("bucket_prefix", "ic-bench")  # stable bucket
-        self.mc_alias = "bench"
-
-        # key builder (provider-agnostic)
-        self.kb = KeyBuilder(run_prefix=self.run_id, base_path=self.data_path)
-
-        # ---- stats ----
-        self.total_bytes = sum(p.stat().st_size for p in self.data_path.rglob("*") if p.is_file())
-        self.total_files = sum(1 for _ in self.data_path.rglob("*") if _.is_file())
-
-        # ---- scratch ----
-        self.tmpdir = Path(tempfile.mkdtemp(prefix="s3bench_"))
-
-    # ---------------- utils ----------------
-    def _sha256_file(self, path: Path) -> str:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
-
-    def _run(self, *cmd: str, timeout: Optional[int] = None) -> Tuple[int, float, str, str]:
-        start = time.perf_counter()
-        proc = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout,
+        prov = self._resolve_provider(cfg, provider_override)
+        self.provider = Provider(
+            id=prov["id"],
+            namespace=prov["namespace"],
+            endpoint=prov["endpoint"],
+            region=prov.get("region", "eu-east-1"),
+            bucket=prov.get("bucket") or prov.get("bucket_prefix", "bench"),
+            insecure_ssl=bool(prov.get("insecure_ssl", False)),
+            profile=prov.get("profile"),
         )
-        dur_ms = (time.perf_counter() - start) * 1000.0
-        return proc.returncode, dur_ms, proc.stdout, proc.stderr
 
-    def _log_event(
-        self,
-        op: str,
-        iteration: int,
-        attempt: int,
-        rc: int,
-        dur_ms: float,
-        extra: Dict[str, Any] | None = None,
-    ) -> None:
-        event = {
-            "ts": datetime.utcnow().isoformat() + "Z",
-            "run_id": self.run_id,
-            "provider": self.provider_name,
-            "bucket": self.bucket,
-            "prefix": self.kb.run_prefix,
-            "op": op,
-            "iteration": iteration,
-            "attempt": attempt,
-            "duration_ms": round(dur_ms, 3),
-            "exit_code": rc,
-            "bytes": self.total_bytes if op in {"PUT", "GET", "DELETE"} else 0,
-            "files": self.total_files,
-            "manifest_sha256": self.manifest_sha256,
-            "seed": self.dataset.get("seed"),
-        }
-        if extra:
-            event.update(extra)
-        with open(self.ndjson_path, "a") as f:
-            json.dump(event, f)
-            f.write("\n")
+        eff_profile = profile or self.provider.profile
+        self.creds = CredentialResolver().resolve(namespace=self.provider.namespace, profile=eff_profile)
+        self.alias = f"alias_{self.provider.id}"
 
-    # ---------------- setup ----------------
-    def setup(self) -> None:
-        logger.info("setup_start", endpoint=self.provider["endpoint"], region=self.provider["region"], bucket=self.bucket)
-        # alias
-        cmd = [
-            "mc",
-            "alias",
-            "set",
-            self.mc_alias,
-            self.provider["endpoint"],
-            self.access_key,
-            self.secret_key,
-            "--api",
-            "s3v4",
-        ]
-        if self.session_token:
-            cmd += ["--session-token", self.session_token]
-        rc, _, out, err = self._run(*cmd, timeout=self.test["timeout_seconds"])
-        if rc != 0:
-            raise RuntimeError(
-                f"mc alias set failed: rc={rc} stderr_tail={err[-400:]} stdout_tail={out[-200:]}"
-            )
+        manifest = self.data_path / "manifest.json"
+        if not manifest.exists():
+            raise FileNotFoundError(f"manifest.json not found at {manifest}")
 
-        # ensure bucket exists (create only if missing)
-        if not self._bucket_exists():
-            rc, _, out, err = self._run(
-                "mc",
-                "mb",
-                f"{self.mc_alias}/{self.bucket}",
-                "--region",
-                self.provider["region"],
-                timeout=self.test["timeout_seconds"],
-            )
-            already = "already exists, and you own it" in (err or "")
-            if rc != 0 and not already:
-                raise RuntimeError(
-                    f"mc mb failed for {self.bucket}: rc={rc} stderr_tail={err[-400:]} stdout_tail={out[-200:]}"
-                )
-            logger.info("bucket_created_or_exists", bucket=self.bucket)
-        else:
-            logger.info("bucket_exists", bucket=self.bucket)
+    def _run(self, cmd: List[str], *, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
-    def _bucket_exists(self) -> bool:
-        rc, _, _, _ = self._run(
-            "mc", "ls", f"{self.mc_alias}/{self.bucket}", "--json", timeout=self.test["timeout_seconds"]
-        )
-        if rc == 0:
-            return True
-        rc2, _, _, _ = self._run("mc", "ls", f"{self.mc_alias}/{self.bucket}", timeout=self.test["timeout_seconds"])
-        return rc2 == 0
+    def _mc(self, *args: str, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        cmd = ["mc", *args]
+        if self.provider.insecure_ssl:
+            cmd.append("--insecure")
+        return self._run(cmd, timeout=timeout)
 
-    # ---------------- warmup ----------------
-    def warmup(self) -> None:
-        n = int(self.test.get("warmup_operations", 0))
-        if n <= 0:
-            return
-        logger.info("warmup_start", count=n)
-        target = f"{self.mc_alias}/{self.bucket}/{self.kb.run_prefix}/"
-        for w in range(1, n + 1):
-            self._run("mc", "cp", "--recursive", f"{self.data_path}/", target, timeout=self.test["timeout_seconds"])
-            self._run("mc", "rm", "--recursive", "--force", target, timeout=self.test["timeout_seconds"])
-            logger.info("warmup_done", index=w)
-        logger.info("warmup_complete")
+    def _alias_set(self) -> None:
+        self._mc("alias", "set", self.alias, self.provider.endpoint, self.creds.access_key, self.creds.secret_key)
 
-    # ---------------- core ops ----------------
-    def _retry(self, op: str, iteration: int, cmd: List[str], fatal: bool = True) -> int:
+    def _alias_rm(self) -> None:
+        self._mc("alias", "remove", self.alias)
+
+    def _mb(self) -> None:
+        self._mc("mb", f"{self.alias}/{self.provider.bucket}")
+
+    def _put(self, src: Path, key: str, timeout: int) -> subprocess.CompletedProcess:
+        return self._mc("cp", str(src), f"{self.alias}/{self.provider.bucket}/{key}", timeout=timeout)
+
+    def _get(self, key: str, timeout: int) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / Path(key).name
+            return self._mc("cp", f"{self.alias}/{self.provider.bucket}/{key}", str(dest), timeout=timeout)
+
+    def _list(self, prefix: str, timeout: int) -> subprocess.CompletedProcess:
+        return self._mc("ls", f"{self.alias}/{self.provider.bucket}/{prefix}", timeout=timeout)
+
+    def _head(self, key: str, timeout: int) -> subprocess.CompletedProcess:
+        return self._mc("stat", f"{self.alias}/{self.provider.bucket}/{key}", timeout=timeout)
+
+    def _delete(self, key: str, timeout: int) -> subprocess.CompletedProcess:
+        return self._mc("rm", f"{self.alias}/{self.provider.bucket}/{key}", timeout=timeout)
+
+    def run(self) -> int:
+        iterations = int(self.test.get("iterations", 1))
+        ops: List[str] = list(self.test.get("operations", ["PUT", "GET", "LIST", "HEAD", "DELETE"]))
+        warmups = int(self.test.get("warmup_operations", 0))
         retries = int(self.test.get("retry_attempts", 0))
-        last_rc = 0
-        for attempt in range(1, retries + 2):
-            rc, dur, out, err = self._run(*cmd, timeout=self.test["timeout_seconds"])
-            self._log_event(op, iteration, attempt, rc, dur, extra={"stdout_tail": out[-200:], "stderr_tail": err[-200:]})
-            if rc == 0:
-                return 0
-            last_rc = rc
-            time.sleep(attempt)
-        if fatal:
-            raise RuntimeError(f"{op} failed after {retries} retries")
-        logger.info("nonfatal_op_failed", op=op, iteration=iteration, rc=last_rc)
-        return last_rc
+        timeout = int(self.test.get("timeout_seconds", 300))
+        cleanup = bool(self.test.get("cleanup_after_run", True))
 
-    def _iter_local_files(self, limit: int | None = None) -> List[Path]:
-        files: List[Path] = []
-        for p in self.data_path.rglob("*"):
-            if p.is_file():
-                files.append(p)
-                if limit and len(files) >= limit:
-                    break
-        return files
-
-    def run(self) -> None:
-        iters = int(self.test.get("iterations", 1))
-        target = f"{self.mc_alias}/{self.bucket}/{self.kb.run_prefix}/"
-
-        for i in range(1, iters + 1):
-            logger.info("iteration_start", i=i, total=iters, op="PUT")
-            self._retry("PUT", i, ["mc", "cp", "--recursive", f"{self.data_path}/", target], fatal=True)
-
-            logger.info("iteration_progress", i=i, op="LIST")
-            self._retry("LIST", i, ["mc", "ls", "--recursive", "--json", target], fatal=True)
-
-            # HEAD targets derived from local dataset → exact object keys
-            head_files = self._iter_local_files(limit=10)
-            for lf in head_files:
-                key = self.kb.object_key(lf)
-                stat_path = f"{self.mc_alias}/{self.bucket}/{key}"
-                self._retry("HEAD", i, ["mc", "stat", "--json", stat_path], fatal=False)
-
-            logger.info("iteration_progress", i=i, op="GET")
-            dl_dir = self.tmpdir / f"dl_{i}"
-            dl_dir.mkdir(parents=True, exist_ok=True)
-            self._retry("GET", i, ["mc", "cp", "--recursive", target, str(dl_dir)], fatal=True)
-            for p in dl_dir.rglob("*"):
-                if p.is_file():
-                    p.unlink()
-
-            logger.info("iteration_progress", i=i, op="DELETE")
-            self._retry("DELETE", i, ["mc", "rm", "--recursive", "--force", target], fatal=True)
-            logger.info("iteration_complete", i=i)
-
-    # ---------------- teardown ----------------
-    def teardown(self) -> None:
-        for p in self.tmpdir.rglob("*"):
-            if p.is_file():
-                p.unlink()
+        ndjson_path = self.data_path / f"{self.provider.id}.ndjson"
+        self._alias_set()
         try:
-            self.tmpdir.rmdir()
-        except Exception:
-            pass
-        logger.info(
-            "run_complete",
-            provider=self.provider_name,
-            bucket=self.bucket,
-            prefix=self.kb.run_prefix,
-            ndjson=str(self.ndjson_path),
-        )
+            self._mb()
+            manifest = json.loads((self.data_path / "manifest.json").read_text())
+            files = manifest.get("files", [])
+            records = [(f["path"], int(f["size"]), self.data_path / f["path"]) for f in files]
 
+            def do(op: str, iteration: int, key: str, size: int, src: Path) -> Dict[str, Any]:
+                attempt = 0
+                start_ns = time.perf_counter_ns()
+                rc = 1
+                while attempt <= retries:
+                    if op == "PUT":
+                        rc = self._put(src, key, timeout).returncode
+                    elif op == "GET":
+                        rc = self._get(key, timeout).returncode
+                    elif op == "LIST":
+                        rc = self._list(Path(key).parent.as_posix(), timeout).returncode
+                    elif op == "HEAD":
+                        rc = self._head(key, timeout).returncode
+                    elif op == "DELETE":
+                        rc = self._delete(key, timeout).returncode
+                    else:
+                        rc = 1
+                    if rc == 0:
+                        break
+                    attempt += 1
+                dur_ms = (time.perf_counter_ns() - start_ns) / 1e6
+                return {"provider": self.provider.id, "op": op, "iteration": iteration, "duration_ms": dur_ms, "bytes": size if op in ("PUT", "GET") else 0, "exit_code": rc}
 
-__all__ = ["S3Harness"]
+            for _ in range(warmups):
+                for op in ops:
+                    for key, size, src in records[:1]:
+                        _ = do(op, 0, key, size, src)
+
+            with ndjson_path.open("w") as out:
+                for it in range(1, iterations + 1):
+                    for op in ops:
+                        for key, size, src in records:
+                            rec = do(op, it, key, size, src)
+                            out.write(json.dumps(rec) + "\n")
+
+            if cleanup:
+                for key, _, _ in records:
+                    self._delete(key, timeout)
+
+            return 0
+        finally:
+            self._alias_rm()
+
+    def _resolve_provider(self, cfg: Dict[str, Any], override: Optional[str]) -> Dict[str, Any]:
+        if "providers" in cfg and isinstance(cfg["providers"], list):
+            items: List[Dict[str, Any]] = cfg["providers"]
+            if override:
+                for p in items:
+                    if p.get("id") == override:
+                        return p
+                raise RuntimeError(f"Unknown provider id: {override}")
+            return items[0]
+        prov = cfg.get("provider")
+        if not isinstance(prov, dict):
+            raise RuntimeError("config.toml missing [provider] or [[providers]]")
+        if "namespace" not in prov:
+            raise RuntimeError("provider missing 'namespace' in config.toml")
+        return prov

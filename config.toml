@@ -1,20 +1,26 @@
+# config.toml — v1.6.0 (final)
+
 [dataset]
 seed = 42
-total_size_gb = 1  # 1GB total
-file_count = 10  # Just 10 files - enough for meaningful stats
-size_distribution = "fixed"  # Fixed size - consistent benchmarking
+# Required by scripts/data_gen.py
+total_size_gb = 1
+file_count = 10
+size_distribution = "fixed"
 min_file_size_mb = 100
-max_file_size_mb = 100  # All files 100MB - tests throughput, not tiny object overhead
+max_file_size_mb = 100
 directory_depth = 1
 files_per_directory = 10
+# Output path used by harness & metrics
 data_path = "./data/s3-bench"
 
-[provider]
-name = "impossible_cloud"
-endpoint = "https://eu-east-1.storage.impossibleapi.net"
+[[providers]]
+id = "ic-eu"
+namespace = "IC_EU"
+endpoint = "https://81.15.150.209"
 region = "eu-east-1"
-bucket_prefix = "pl-01"
-storage_class = "STANDARD"
+bucket = "pl-01"
+insecure_ssl = true
+profile = ""
 
 [test]
 iterations = 3

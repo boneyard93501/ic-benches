@@ -1,93 +1,41 @@
-- name: Collect ic-benches metrics archive from VM
+# ansible/collect.yml — v1.6.0 (final)
+# Fetch newest metrics_*.tar.gz from remote to a configurable repo-root path
+
+- name: Collect latest metrics archive to controller
   hosts: bench
   gather_facts: no
   vars:
-    # -------- Defaults (override with -e as needed) --------
     repo_path: /opt/ic-benches
     archive_glob: "{{ repo_path }}/.bench_archives/metrics_*.tar.gz"
-
-    collect_mode: local            # local | s3
-    local_dest: ./metrics          # used when collect_mode=local
-
-    s3_bucket: ""                  # used when collect_mode=s3
-    s3_prefix: "ic-benches/results"
-    s3_region: "us-east-1"
-    # AWS creds are read from env if not passed:
-    aws_access_key_id: "{{ lookup('env','AWS_ACCESS_KEY_ID') | default('', true) }}"
-    aws_secret_access_key: "{{ lookup('env','AWS_SECRET_ACCESS_KEY') | default('', true) }}"
-    aws_session_token: "{{ lookup('env','AWS_SESSION_TOKEN') | default('', true) }}"
+    # override with: METRICS_DIR=/abs/path make collect-local
+    metrics_dir: "{{ lookup('env','METRICS_DIR') | default((playbook_dir + '/../metrics'), true) | realpath }}"
 
   tasks:
-    - name: Find latest archive on VM
+    - name: Show metrics_dir (controller)
+      delegate_to: localhost
+      ansible.builtin.debug:
+        msg: "metrics_dir resolved to: {{ metrics_dir }}"
+
+    - name: Find newest metrics archive on remote
       ansible.builtin.shell: "ls -1t {{ archive_glob }} 2>/dev/null | head -n1"
-      register: found_archive
+      register: newest
       changed_when: false
-      failed_when: found_archive.stdout | trim == ""
+      failed_when: newest.stdout | trim == ""
 
-    - name: Set archive fact
-      ansible.builtin.set_fact:
-        metrics_archive: "{{ found_archive.stdout | trim }}"
-
-    # -------------------- LOCAL COLLECTION --------------------
-    - name: Ensure local destination exists
-      when: collect_mode == "local"
+    - name: Ensure metrics_dir exists (controller)
       delegate_to: localhost
       ansible.builtin.file:
-        path: "{{ local_dest }}"
+        path: "{{ metrics_dir }}"
         state: directory
         mode: "0755"
 
-    - name: Fetch archive to controller (local)
-      when: collect_mode == "local"
+    - name: Fetch newest archive (remote → controller)
       ansible.builtin.fetch:
-        src: "{{ metrics_archive }}"
-        dest: "{{ local_dest }}/"
+        src: "{{ newest.stdout | trim }}"
+        dest: "{{ metrics_dir }}/"
         flat: yes
 
-    # -------------------- S3 COLLECTION --------------------
-    - name: Create temp dir on controller for S3 upload
-      when: collect_mode == "s3"
+    - name: Report fetched path
       delegate_to: localhost
-      ansible.builtin.tempfile:
-        state: directory
-        suffix: _ic_benches
-      register: tmp_dir
-
-    - name: Fetch archive to controller temp (S3 mode)
-      when: collect_mode == "s3"
-      ansible.builtin.fetch:
-        src: "{{ metrics_archive }}"
-        dest: "{{ tmp_dir.path }}/"
-        flat: yes
-
-    - name: Ensure amazon.aws collection present (controller)
-      when: collect_mode == "s3"
-      delegate_to: localhost
-      ansible.builtin.command: ansible-galaxy collection install amazon.aws
-      changed_when: false
-
-    - name: Upload archive to S3
-      when: collect_mode == "s3"
-      delegate_to: localhost
-      amazon.aws.aws_s3:
-        mode: put
-        region: "{{ s3_region }}"
-        bucket: "{{ s3_bucket }}"
-        object: >-
-          {{ (s3_prefix | trim('/')) ~ '/' ~ (metrics_archive | basename) }}
-        src: "{{ tmp_dir.path }}/{{ metrics_archive | basename }}"
-        aws_access_key: "{{ aws_access_key_id | default(omit) }}"
-        aws_secret_key: "{{ aws_secret_access_key | default(omit) }}"
-        security_token: "{{ aws_session_token | default(omit) }}"
-
-    # -------------------- OUTPUT --------------------
-    - name: Result (local)
-      when: collect_mode == "local"
       ansible.builtin.debug:
-        msg: "Fetched: {{ local_dest }}/{{ metrics_archive | basename }}"
-
-    - name: Result (s3)
-      when: collect_mode == "s3"
-      ansible.builtin.debug:
-        msg: >-
-          Uploaded: s3://{{ s3_bucket }}/{{ (s3_prefix | trim('/')) }}/{{ metrics_archive | basename }}
+        msg: "✅ Fetched: {{ metrics_dir }}/{{ (newest.stdout | trim) | basename }}"
