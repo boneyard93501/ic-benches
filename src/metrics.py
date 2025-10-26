@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Metrics processor — v1.6.1
-Fix: ensure consolidated summary has MBps column by computing it on each frame before concatenation.
+"""Metrics processor — v1.6.2
+Change: error rate is reported as percentage (0–100), column name 'error_rate_pct'.
 """
 from __future__ import annotations
 
@@ -53,10 +53,9 @@ class MetricsProcessor:
                     rows.append(rec)
         df = pd.DataFrame(rows)
         if not df.empty:
-            # ensure numeric types
             df["duration_ms"] = pd.to_numeric(df["duration_ms"], errors="coerce")
             df["bytes"] = pd.to_numeric(df["bytes"], errors="coerce").fillna(0)
-            # compute throughput per record for consolidated summary
+            df["exit_code"] = pd.to_numeric(df["exit_code"], errors="coerce").fillna(0)
             df["MBps"] = (df["bytes"] / 1e6) / (df["duration_ms"] / 1000.0)
         return df
 
@@ -64,9 +63,9 @@ class MetricsProcessor:
         g = df.groupby(["op", "iteration"])
         q = g["duration_ms"].describe(percentiles=[0.5, 0.95, 0.99])[ ["50%", "95%", "99%", "mean", "count"] ]
         q = q.rename(columns={"50%": "p50_ms", "95%": "p95_ms", "99%": "p99_ms", "mean": "avg_ms", "count": "samples"})
-        # MB/s and error rate per op
-        err = df.groupby("op")["exit_code"].apply(lambda x: (pd.to_numeric(x, errors='coerce') != 0).mean())
-        out = q.join(err, on="op").rename(columns={"exit_code": "error_rate"})
+        # error rate in percent
+        err_pct = df.groupby("op")["exit_code"].apply(lambda x: (x != 0).mean() * 100.0)
+        out = q.join(err_pct, on="op").rename(columns={"exit_code": "error_rate_pct"})
         out["provider"] = provider
         csvp = self.data_path / f"metrics_{provider}.csv"
         out.to_csv(csvp)
@@ -93,7 +92,7 @@ class MetricsProcessor:
             p99_ms=("duration_ms", lambda x: x.quantile(0.99)),
             avg_ms=("duration_ms", "mean"),
             MBps=("MBps", "mean"),
-            error_rate=("exit_code", lambda x: (pd.to_numeric(x, errors='coerce') != 0).mean()),
+            error_rate_pct=("exit_code", lambda x: (pd.to_numeric(x, errors='coerce') != 0).mean() * 100.0),
             samples=("duration_ms", "count"),
         ).reset_index()
         consolidated = self.data_path / "consolidated_metrics.csv"

@@ -66,3 +66,27 @@ visualize-all: collect-local unpack metrics visualize
 .PHONY: excel
 excel: metrics
 	uv run python scripts/export_excel.py --input metrics/extracted/data/s3-bench/consolidated_metrics.csv
+
+# Orchestrated end-to-end pipeline
+# Usage:
+#   make pipeline                 # full deploy
+#   make pipeline QUICK=1         # quick deploy
+#   make pipeline RUN_PROVIDER=ic-us
+#   make pipeline QUICK=1 EXCEL=1 # quick + build Excel
+# Vars (optional): QUICK=0|1, EXCEL=0|1, RUN_PROVIDER=<id>
+
+.PHONY: pipeline
+pipeline:
+	@echo ">>> pipeline: RUN_PROVIDER=$(RUN_PROVIDER) QUICK=$(QUICK) EXCEL=$(EXCEL)"
+	@if [ "$(QUICK)" = "1" ] || [ "$(QUICK)" = "true" ]; then \
+		$(MAKE) deploy-quick $(if $(RUN_PROVIDER),RUN_PROVIDER=$(RUN_PROVIDER)); \
+	else \
+		$(MAKE) deploy $(if $(RUN_PROVIDER),RUN_PROVIDER=$(RUN_PROVIDER)); \
+	fi
+	$(MAKE) collect-local
+	$(MAKE) unpack
+	$(MAKE) metrics
+	@if [ "$(EXCEL)" = "1" ] || [ "$(EXCEL)" = "true" ]; then \
+		$(MAKE) excel; \
+	fi
+	$(MAKE) visualize

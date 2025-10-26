@@ -13,6 +13,7 @@ files_per_directory = 10
 # Output path used by harness & metrics
 data_path = "./data/s3-bench"
 
+
 [[providers]]
 id = "ic-eu"
 namespace = "IC_EU"
@@ -20,7 +21,17 @@ endpoint = "https://81.15.150.209"
 region = "eu-east-1"
 bucket = "pl-01"
 insecure_ssl = true
-profile = ""
+create_bucket = false   # do NOT attempt create over IP; pre-create once via your infra
+
+[[providers]]
+id = "impossible_cloud"
+namespace = "IMPOSSIBLE_CLOUD"
+endpoint = "https://eu-east-1.storage.impossibleapi.net"
+region = "eu-east-1"
+bucket = "pl-01"
+insecure_ssl = false
+create_bucket = true
+
 
 [test]
 iterations = 3
