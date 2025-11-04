@@ -1,111 +1,203 @@
-# test_bucket_ic_eu_safe.yml — robust ic-eu bucket-creation test with non-fatal logging
+#!/usr/bin/env python3
+"""S3 Bench Harness — v1.6.4
+Fix: use correct `mc alias set --path on` (not bare --path).
+Keeps: S3v4, path‑style for IP endpoints, explicit --region on mb, fail‑fast on errors, NDJSON error/attempts.
+"""
+from __future__ import annotations
 
-- name: Safe bucket-creation test for ic-eu
-  hosts: bench
-  gather_facts: yes
-  vars:
-    repo_path: /opt/ic-benches
-    log_file: "{{ repo_path }}/bucket_test_ic_eu.log"
-    tmp_http_endpoint: ""
+import json
+import subprocess
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Any, List, Optional
 
-  tasks:
-    - name: Load .env vars if available
-      shell: |
-        set -a
-        [ -f "{{ repo_path }}/.env" ] && . "{{ repo_path }}/.env"
-        set +a
-        env
-      register: env_vars
-      changed_when: false
+import tomli
+from credentials import CredentialResolver
 
-    - name: Parse config.toml for ic-eu provider
-      delegate_to: localhost
-      shell: |
-        python3 - <<'PYCODE'
-        import tomllib, json
-        cfg = tomllib.load(open("config.toml","rb"))
-        ic = next(p for p in cfg["providers"] if p["id"]=="ic-eu")
-        print(json.dumps(ic))
-        PYCODE
-      args:
-        chdir: "{{ playbook_dir }}/.."
-      register: ic_provider
-      changed_when: false
+@dataclass(frozen=True)
+class Provider:
+    id: str
+    namespace: str
+    endpoint: str
+    region: str
+    bucket: str
+    insecure_ssl: bool = False
+    profile: Optional[str] = None
 
-    - name: Set provider facts
-      set_fact:
-        ic_conf: "{{ ic_provider.stdout | from_json }}"
-        endpoint: "{{ (ic_provider.stdout | from_json).endpoint }}"
-        namespace: "{{ (ic_provider.stdout | from_json).namespace }}"
-        bucket: "{{ (ic_provider.stdout | from_json).bucket }}"
-        insecure: "{{ (ic_provider.stdout | from_json).insecure_ssl | default(false) }}"
+class S3Harness:
+    def __init__(self, *, config_file: str = "config.toml", provider_override: Optional[str] = None, profile: Optional[str] = None):
+        self.config_path = Path(config_file)
+        with open(self.config_path, "rb") as f:
+            cfg = tomli.load(f)
+        self.cfg = cfg
+        self.dataset = cfg["dataset"]
+        self.test = cfg.get("test", {})
+        self.data_path = Path(self.dataset["data_path"]).resolve()
+        self.data_path.mkdir(parents=True, exist_ok=True)
 
-    - name: Show provider info
-      debug:
-        msg: "Testing bucket {{ bucket }} on {{ endpoint }} (namespace={{ namespace }}, insecure_ssl={{ insecure }})"
+        prov = self._resolve_provider(cfg, provider_override)
+        self.provider = Provider(
+            id=prov["id"],
+            namespace=prov["namespace"],
+            endpoint=prov["endpoint"],
+            region=prov.get("region", "us-east-1"),
+            bucket=prov.get("bucket") or prov.get("bucket_prefix", "bench"),
+            insecure_ssl=bool(prov.get("insecure_ssl", False)),
+            profile=prov.get("profile"),
+        )
 
-    - name: Try HTTPS bucket creation first
-      shell: |
-        set -e
-        mc alias rm {{ namespace }} >/dev/null 2>&1 || true
-        if [ "{{ insecure }}" = "true" ]; then
-          mc alias set {{ namespace }} {{ endpoint }} "$ACCESS_KEY" "$SECRET_KEY" --api S3v4 --insecure
-          mc mb --ignore-existing --insecure {{ namespace }}/{{ bucket }}
-        else
-          mc alias set {{ namespace }} {{ endpoint }} "$ACCESS_KEY" "$SECRET_KEY" --api S3v4
-          mc mb --ignore-existing {{ namespace }}/{{ bucket }}
-        fi
-      register: https_result
-      ignore_errors: yes
+        eff_profile = profile or self.provider.profile
+        self.creds = CredentialResolver().resolve(namespace=self.provider.namespace, profile=eff_profile)
+        self.alias = f"alias_{self.provider.id}"
 
-    - name: If HTTPS fails, derive HTTP endpoint
-      set_fact:
-        tmp_http_endpoint: "{{ endpoint | regex_replace('^https', 'http') }}"
-      when: https_result.rc != 0
+        manifest = self.data_path / "manifest.json"
+        if not manifest.exists():
+            raise FileNotFoundError(f"manifest.json not found at {manifest}")
 
-    - name: Retry with HTTP (if previous failed)
-      shell: |
-        set -e
-        if [ -n "{{ tmp_http_endpoint }}" ]; then
-          mc alias rm {{ namespace }} >/dev/null 2>&1 || true
-          mc alias set {{ namespace }} {{ tmp_http_endpoint }} "$ACCESS_KEY" "$SECRET_KEY" --api S3v4 --insecure
-          mc mb --ignore-existing --insecure {{ namespace }}/{{ bucket }}
-        fi
-      register: http_result
-      when: https_result.rc != 0
-      ignore_errors: yes
+    # ----- helpers -----
+    def _run(self, cmd: List[str], *, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
-    - name: Summarize results
-      set_fact:
-        final_rc: "{{ 0 if https_result.rc == 0 else (http_result.rc | default(1)) }}"
-        final_stdout: "{{ https_result.stdout if https_result.rc == 0 else (http_result.stdout | default('')) }}"
-        final_stderr: "{{ https_result.stderr if https_result.rc == 0 else (http_result.stderr | default('')) }}"
+    def _mc(self, *args: str, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        cmd = ["mc", *args]
+        if self.provider.insecure_ssl and "--insecure" not in cmd:
+            cmd.append("--insecure")
+        return self._run(cmd, timeout=timeout)
 
-    - name: Write detailed log to remote file
-      copy:
-        dest: "{{ log_file }}"
-        content: |
-          Timestamp: {{ ansible_date_time.iso8601 }}
-          Endpoint: {{ endpoint }}
-          HTTP fallback: {{ tmp_http_endpoint | default('none') }}
-          Namespace: {{ namespace }}
-          Bucket: {{ bucket }}
-          Insecure SSL: {{ insecure }}
-          Result code: {{ final_rc }}
-          --- HTTPS stdout ---
-          {{ https_result.stdout | default('') }}
-          --- HTTPS stderr ---
-          {{ https_result.stderr | default('') }}
-          --- HTTP stdout ---
-          {{ http_result.stdout | default('') if http_result is defined else '' }}
-          --- HTTP stderr ---
-          {{ http_result.stderr | default('') if http_result is defined else '' }}
+    def _alias_set(self) -> None:
+        # Force S3v4 and PATH style for IP endpoints: `--path on`
+        args = [
+            "alias", "set", self.alias,
+            self.provider.endpoint, self.conversion_safe(self.creds.access_key), self.conversion_safe(self.creds.secret_key),
+            "--api", "S3v4", "--path", "on"
+        ]
+        if self.provider.insecure_ssl:
+            args.append("--insecure")
+        r = self._mc(*args)
+        if r.returncode != 0:
+            raise RuntimeError(f"mc alias set failed: {r.stderr.strip()}")
 
-    - name: Print concise outcome
-      debug:
-        msg: >
-          {% if final_rc == 0 %}
-          ✅ SUCCESS: Bucket {{ bucket }} created or exists on {{ endpoint }}
-          {% else %}
-          ⚠️  FAILED: Could not create bucket {{ bucket }} (check {{ log_file }})
-          {% endif %}
+    def _alias_rm(self) -> None:
+        self._mc("alias", "remove", self.alias)
+
+    def _mb(self) -> None:
+        # Explicit region helps some S3‑compatible services
+        r = self._mc("mb", f"{self.alias}/{self.provider.bucket}", "--region", self.provider.region)
+        if r.returncode != 0:
+            s = (r.stderr or "").lower()
+            benign = ("already exists" in s) or ("already owned by you" in s) or ("bucketalreadyownedbyyou" in s)
+            if not benign:
+                raise RuntimeError(f"Bucket create failed for {self.provider.bucket}: {r.stderr.strip()}")
+
+    def _put(self, src: Path, key: str, timeout: int) -> subprocess.CompletedProcess:
+        return self._mc("cp", str(src), f"{self.alias}/{self.provider.bucket}/{key}", timeout=timeout)
+
+    def _get(self, key: str, timeout: int) -> subprocess.CompletedProcess:
+        with tempfile.TemporaryDirectory() as td:
+            dest = Path(td) / Path(key).name
+            return self._mc("cp", f"{self.alias}/{self.provider.bucket}/{key}", str(dest), timeout=timeout)
+
+    def _list(self, prefix: str, timeout: int) -> subprocess.CompletedProcess:
+        return self._mc("ls", f"{self.alias}/{self.provider.bucket}/{prefix}", timeout=timeout)
+
+    def _head(self, key: str, timeout: int) -> subprocess.CompletedProcess:
+        return self._mc("stat", f"{self.alias}/{self.provider.bucket}/{key}", timeout=timeout)
+
+    def _delete(self, key: str, timeout: int) -> subprocess.ProgressBar:
+        return self._mc("rm", f"{self.alias}/{self.provider.bucket}/{key}", timeout=timeout)
+
+    # ensure secrets with special chars are passed safely
+    @staticmethod
+    def conversion_safe(s: str) -> str:
+        return s
+
+    # ----- run -----
+    def run(self) -> int:
+        iterations = int(self.test.get("iterations", 1))
+        ops: List[str] = list(self.test.get("operations", ["PUT", "GET", "LIST", "HEAD", "DELETE"]))
+        warmups = int(self.test.get("warmup_operations", 0))
+        retries = int(self.test.get("retry_attempts", 0))
+        timeout = int(self.test.get("timeout_seconds", 300))
+        cleanup = bool(self.test.get("cleanup_after_run", True))
+
+        ndjson_path = self.data_path / f"{self.provider.id}.ndjson"
+        self._alias_set()
+        try:
+            self._mb()
+            manifest = json.loads((self.data_path / "manifest.json").read_text())
+            files = manifest.get("files", [])
+            records = [(f["path"], int(f["size"]), self.data_path / f["path"]) for f in files]
+
+            def do(op: str, iteration: int, key: str, size: int, src: Path) -> Dict[str, Any]:
+                attempt = 0
+                start_ns = time.perf_counter_ns()
+                last: Optional[subprocess.CompletedProcess] = None
+                rc = 1
+                while attempt <= retries:
+                    if op == "PUT":
+                        last = self._put(src, key, timeout)
+                    elif op == "GET":
+                        last = self._get(key, timeout)
+                    elif op == "LIST":
+                        last = self._list(Path(key).parent.as_posix(), timeout)
+                    elif op == "HEAD":
+                        last = self._head(key, timeout)
+                    elif op == "DELETE":
+                        last = self._delete(key, timeout)
+                    else:
+                        return {"provider": self.provider.id, "op": op, "iteration": iteration, "duration_ms": 0.0, "bytes": 0, "exit_code": 1, "attempts": attempt+1, "error": f"unknown op: {op}"}
+                    rc = last.returncode
+                    if rc == 0:
+                        break
+                    attempt += 1
+                dur_ms = (time.perf_counter_ns() - start_ns) / 1e6
+                err = (last.stderr or "") if last else ""
+                err_last = err.strip().splitlines()[-1] if err.strip().splitlines() else ""
+                return {
+                    "provider": self.provider.id,
+                    "op": op,
+                    "iteration": iteration,
+                    "duration_ms": dur_ms,
+                    "bytes": size if op in ("PUT", "GET") else 0,
+                    "exit_code": rc,
+                    "attempts": attempt + 1,
+                    "error": err_last,
+                }
+
+            for _ in range(warmups):
+                for op in ops:
+                    for key, size, src in records[:1]:
+                        _ = do(op, 0, key, size, src)
+
+            with ndjson_path.open("w") as out:
+                for it in range(1, iterations + 1):
+                    for op in ops:
+                        for key, size, src in records:
+                            rec = do(op, it, key, size, src)
+                            out.write(json.dumps(rec) + "\n")
+
+            if cleanup:
+                for key, _, _ in records:
+                    self._delete(key, timeout)
+
+            return 0
+        finally:
+            self._alias_rm()
+
+    def _resolve_provider(self, cfg: Dict[str, Any], override: Optional[str]) -> Dict[str, Any]:
+        if "providers" in cfg and isinstance(cfg["providers"], list):
+            items: List[Dict[str, Any]] = cfg["providers"]
+            if override:
+                for p in items:
+                    if p.get("id") == override:
+                        return p
+                raise RuntimeError(f"Unknown provider id: {override}")
+            return items[0]
+        prov = cfg.get("provider")
+        if not isinstance(prov, dict):
+            raise RuntimeError("config.toml missing [provider] or [[providers]]")
+        if "namespace" not in prov:
+            raise RuntimeError("provider missing 'namespace' in config.toml")
+        return prov
