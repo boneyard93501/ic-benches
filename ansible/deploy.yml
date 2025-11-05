@@ -131,6 +131,15 @@
         "{{ uv_bin }}" pip install -e .
       args:
         chdir: "{{ repo_path }}"
+    
+    - name: Remove old NDJSON and CSV metrics on remote
+      ansible.builtin.shell: >
+        rm -f {{ repo_path }}/data/s3-bench/*.ndjson
+              {{ repo_path }}/data/s3-bench/metrics_*.csv
+              {{ repo_path }}/data/s3-bench/consolidated_metrics.csv
+      args:
+        chdir: "{{ repo_path }}"
+      ignore_errors: yes
 
     - name: Generate dataset (idempotent)
       ansible.builtin.shell: >

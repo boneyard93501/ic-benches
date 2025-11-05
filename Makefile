@@ -90,3 +90,14 @@ pipeline:
 		$(MAKE) excel; \
 	fi
 	$(MAKE) visualize
+
+.PHONY: clean-data
+clean-data:
+	@echo "Removing all extracted NDJSON and CSVs..."
+	rm -rf metrics/extracted/data/s3-bench/*
+	@echo "✅ Cleaned metrics/extracted/data/s3-bench"
+
+.PHONY: dashboard
+dashboard:
+	uv run python scripts/combine_charts.py
+
